@@ -108,12 +108,17 @@ v4 milestones (all 2026-11-19/20; QC method, results on 64 or 128 held-out layou
 - Runs `runs_pp/ours_v5_s{0,1}` (weld) and `ours_v5_s{0,1}_fr` (friction); checkpoint selection + test by `runs/select_v6.sh`
   → `eval_pp/v5_s*_fr/{val_*,test_*}.json`.
 - Friction grasp, test (128 layouts): seed 0 400k 86.7 %, seed 1 400k 89.8 %; failures mostly timeouts after a grasp; spill in
-  successes 0.07–0.16 %; glass slip along the glass axis while held 4–6 mm mean, over 3 cm in 2 episodes (seed 0, max 3.7 cm);
-  measured by `eval_qc_g1pp.py` (`slip_along_max`, `lost_grip`) in `eval_pp/v5_s*_fr/test_400000_slip.json`.
-- Videos `videos/g1_pp_v5_500k*.mp4` (weld), `videos/g1_pp_fr_*.mp4` (friction).
+  successes 0.07–0.16 %; glass slip along the glass axis WHILE HELD 4–6 mm mean, over 3 cm in 2 episodes (seed 0, max 3.7 cm);
+  measured by `eval_qc_g1pp.py` (`slip_along_max`, `lost_grip`) in `eval_pp/v5_s*_fr/test_400000_slip.json`. The slip number
+  stops when the glass leaves the ring, so slip-outs are not in it: `lost_grip` (held flag drops in a closed hand) counts them
+  together with flag flicker (21–39 of 128 episodes, most still successes). Seen in the video: one glass slid out of the
+  fingers during the lift (tilt 8.5°) and the policy never re-grasped; one far-edge grasp closed ~2 cm too high, never held,
+  and the closed hand dragged the glass along the table.
+- Videos `videos/g1_pp_v5_500k*.mp4` (weld), `videos/g1_pp_fr_400k.mp4` and `_far_targets.mp4` (friction, seed 1, labelled).
 
 ## Open environment issues (the env session's backlog)
-1. **"held" flickers** with the friction grasp: the ring check fails when the glass tilts past 10° or nudges out of its tolerance
+1. **"held" flickers, and real slip-outs are not separated from flicker** with the friction grasp (needs a measure that tells a
+   drop in the air from a slide onto the table from a flag flicker): the ring check fails when the glass tilts past 10° or nudges out of its tolerance
    while still firmly in the hand (seen in 21–39 of 128 test episodes). Side effects: the actor's held flag flickers, the push cost
    counts the carried glass as a pushed free glass, the contact cost may fire. Needs a robust held state (hysteresis while the hand
    stays closed, or contact-based), then new demos + start bank + retraining.
