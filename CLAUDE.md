@@ -94,8 +94,16 @@ v4 milestones (all 2026-11-19/20; QC method, results on 64 or 128 held-out layou
   (10) × free-glass displacement; glass speed²; hand within `CONTACT_D` (2 cm) of the free glass.
 - **Success**: glass within 3 cm of the target, tilt < 5°, not held, hand ≥ 4 cm away, spill ≤ 2 % (`G1P_SUCCESS_SPILL`).
   **Failures**: glass down (> 45°), spill > 30 %, time out (`G1P_EPISODE_S` 20 s = 300 steps).
-- **Start bank** (`G1P_START_BANK`, share `G1P_START_FRACTION` 0.5): resets from demo states (pregrasp, grasped, carry, lower),
-  with the recorded finger angles for held starts (`make_start_bank.py` from demos with `hand_q`).
+- **Reset states** (our method's, the same as the excavator paper's; `G1P_RESET_STATES=<start bank npz>`, added 2026-11-20):
+  every reset draws one entry from a fixed bank of standard starts (seeded layouts, robot at READY; as many as the demo starts,
+  `G1P_RESET_STANDARD_FRACTION` 0.5) and demo starts (below), and the episode's success is recorded against it.
+  `G1P_RESET_MODE=adaptive` (default): AlphaNIST success-guided sampling pooled per start type (`type_pooled`, eps_q 0.05,
+  last 64 outcomes, 2 pseudo-outcomes at 0.5: agxcave's `V1_SGS`); `uniform`: the same bank drawn uniformly (the baseline).
+  `v4/sgs_sampler.py` is agxcave's `agxcave/agxpolicy/sgs/sampler.py` byte for byte (feat/mt3d-v1 eebcde5); `v4/reset_states.py`
+  builds the bank. The server log prints each start type's success estimate and draw share every 500 episodes. Off during
+  evaluation (`G1P_EVAL_SEED`). Use this for every new run, so the method is the same on every task (user, 2026-11-20).
+- Older runs: `G1P_START_BANK` (share `G1P_START_FRACTION` 0.5) sent half the resets to demo states drawn uniformly and the other
+  half to fresh random layouts; kept only to reproduce those runs (`*_fr`, `*_rec`).
 - The server (`g1_pp_server.py`) also reports, for evaluation only, the noise-free ring/glass/up state (`extras["clean"]`).
 
 ### Physics randomisation (`G1P_DR=1`, off by default; added 2026-11-20)
@@ -108,10 +116,11 @@ uses the larger value of a contact pair); stiffness and damping of every actuato
 0 on start-bank resets, whose states were recorded at the default height). The critics see the drawn values (privileged block
 11 → 17), so DR runs need demos and start banks recorded with `G1P_DR=1` (`demos_pp_v6_dr.npz`, `start_bank_v7_dr.npz`).
 
-### Start banks
-`make_start_bank.py` builds pregrasp / grasped / carry / lower starts from the demos; `--recovery` adds slipped (closed hand
-over a free upright glass, not held), near_miss (lower state with the target moved 2–5 cm) and far_pregrasp (glasses at
-x ≥ 0.37 twice) starts: `start_bank_v6.npz` (1,216 starts, no DR), `start_bank_v7_dr.npz` (with DR).
+### Demo starts of the reset-state bank
+`make_start_bank.py` builds pregrasp / grasped / carry / lower starts from the demos; `--recovery` adds three more start types,
+slipped (closed hand over a free upright glass, not held), near_miss (lower state with the target moved 2–5 cm) and far_pregrasp
+(glasses at x ≥ 0.37 twice): `start_bank_v6.npz` (1,216 starts, no DR), `start_bank_v7_dr.npz` (with DR). They are reset
+states like the others; the flag name is historical.
 
 ### Demonstrator and data
 - `gen_pp_demos.py`: scripted pick-and-place (9-joint damped least squares, waist weighted 0.3; approach from the open side,

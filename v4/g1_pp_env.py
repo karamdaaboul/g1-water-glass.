@@ -331,6 +331,10 @@ class G1PPEnv(ManagerBasedRLEnv):
         ev = os.environ.get("G1P_EVAL_SEED")
         self.eval_bank = None if ev is None else self._layout_bank(int(ev), 4096, d)
         self.episode_count = torch.zeros(n, dtype=torch.long, device=d)
+        # Reset states (the task's G1P_RESET_STATES): an env whose drawn entry is a standard start takes its layout from the bank
+        self.layout_forced = torch.zeros(n, dtype=torch.bool, device=d)
+        self.layout_start = torch.zeros(n, 2, device=d)
+        self.layout_target = torch.zeros(n, 2, device=d)
         self._target_markers = None
         self._weld_idx = None
         self._markers = None
@@ -506,6 +510,10 @@ class G1PPEnv(ManagerBasedRLEnv):
             if not bad.any():
                 break
             tgt[bad] = tlo + (thi - tlo) * torch.rand(int(bad.sum()), 2, device=self.device)
+        forced = getattr(self, "layout_forced", None)
+        if forced is not None and bool(forced[ids].any()):  # reset states: standard entries start from their bank layout
+            f = forced[ids]
+            start[f], tgt[f] = self.layout_start[ids][f], self.layout_target[ids][f]
         if self.eval_bank is not None:
             k = (self.episode_count[ids] * self.num_envs + ids) % self.eval_bank[0].shape[0]
             start, tgt = self.eval_bank[0][k], self.eval_bank[1][k]

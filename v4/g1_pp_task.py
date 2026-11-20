@@ -36,6 +36,7 @@ Costs (4 channels, extras["costs"] (N, 4)):
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 
@@ -86,6 +87,15 @@ PUSH_K = float(os.environ.get("G1P_PUSH_K", "10.0"))
 # G1P_START_FRACTION (default 0.5) of the resets to a demo state (pregrasp / grasped / carry / lower), as the excavator's reset bank.
 START_BANK = os.environ.get("G1P_START_BANK")
 START_FRACTION = float(os.environ.get("G1P_START_FRACTION", "0.5"))
+# Reset states of our method (2026-11-20, user: "the used method should be the same ... reset state, it can be success-guided or
+# uniform"): G1P_RESET_STATES=<make_start_bank.py npz> draws EVERY reset from a bank of standard starts and these demo starts,
+# with agxcave's sampler (reset_states.py); G1P_RESET_MODE adaptive (the excavator paper's type_pooled) or uniform. Replaces
+# G1P_START_BANK (kept for the older runs). Off under G1P_EVAL_SEED (evaluation layouts).
+RESET_STATES = os.environ.get("G1P_RESET_STATES") if os.environ.get("G1P_EVAL_SEED") is None else None
+RESET_MODE = os.environ.get("G1P_RESET_MODE", "adaptive")
+RESET_STANDARD_FRACTION = float(os.environ.get("G1P_RESET_STANDARD_FRACTION", "0.5"))
+RESET_SEED = int(os.environ.get("G1P_RESET_SEED", "20261120"))  # the standard layouts; evaluation uses seeds 3 and 7
+RESET_LOG_EVERY = 500  # episodes between the per-type lines in the server log
 CONTACT_D = 0.02
 
 
@@ -263,14 +273,28 @@ class G1PPTaskEnv(G1PPEnv):
         self._final_gpos = torch.zeros(n, 3, device=d)
         self._final_clean = torch.zeros(n, 9, device=d)
         self.start_bank = None
-        if START_BANK:
+        self.reset_states = None
+        self.reset_entry = torch.full((n,), -1, dtype=torch.long, device=d)
+        if RESET_STATES and START_BANK:
+            raise ValueError("G1P_RESET_STATES replaces G1P_START_BANK: set one of them")
+        if START_BANK or RESET_STATES:
             import numpy as _np  # noqa: PLC0415
-            b = _np.load(START_BANK)
+            b = _np.load(START_BANK or RESET_STATES)
             self.start_bank = {k: torch.as_tensor(b[k], device=d) for k in ("q", "closed", "held", "glass", "up", "target", "type")
                                + (("hand_q",) if "hand_q" in b.files else ())}
             if not WELD and "hand_q" not in self.start_bank:
                 raise ValueError(f"{START_BANK}: the friction grasp needs a start bank with finger angles (demos v5+)")
-            print(f"[task] start bank {START_BANK}: {len(b['type'])} starts, share {START_FRACTION}", flush=True)
+            if START_BANK:
+                print(f"[task] start bank {START_BANK}: {len(b['type'])} starts, share {START_FRACTION}", flush=True)
+            else:
+                from reset_states import ResetStates  # noqa: PLC0415
+                n_std = ResetStates.standard_count(len(b["type"]), RESET_STANDARD_FRACTION)
+                std_start, std_target = G1PPEnv._layout_bank(RESET_SEED, n_std, "cpu")
+                self.reset_states = ResetStates(list(b["types"]), b["type"], std_start.numpy(), std_target.numpy(), RESET_MODE,
+                                                RESET_SEED)
+                self.rs_start, self.rs_target = std_start.to(d), std_target.to(d)
+                print(f"[task] reset states {RESET_STATES}: {n_std} standard + {len(b['type'])} demo starts, mode {RESET_MODE}, "
+                      f"{self.reset_states.sampler.profile} {self.reset_states.sampler.params.to_dict()}", flush=True)
         self.push_m = torch.zeros(n, device=d)
         super().__init__(cfg, **kwargs)
         self._arm_ids = self.action_manager.get_term("right_arm")._joint_ids
@@ -489,6 +513,20 @@ class G1PPTaskEnv(G1PPEnv):
         if DR and self._ready and self.water_sim is not None:  # fill level before the water resets (super and the bank)
             free = DR_FREE[0] + (DR_FREE[1] - DR_FREE[0]) * torch.rand(len(ids), device=self.device)
             self.water_sim.set_fill(ids, CAVITY - free)
+        entries = None
+        if self._ready and self.reset_states is not None:  # the finished episodes' outcomes, then each env's next entry
+            success = self.termination_manager.get_term("success")[ids]
+            for e, s in zip(self.reset_entry[ids].tolist(), success.tolist()):
+                if e >= 0:
+                    self.reset_states.record(e, bool(s))
+                    if self.reset_states.episodes % RESET_LOG_EVERY == 0:
+                        print(f"[reset states] {json.dumps(self.reset_states.summary())}", flush=True)
+            entries = torch.as_tensor(self.reset_states.draw(len(ids)), device=self.device)
+            self.reset_entry[ids] = entries
+            std = entries < self.reset_states.n_standard
+            self.layout_forced[ids] = std
+            self.layout_start[ids[std]] = self.rs_start[entries[std]]
+            self.layout_target[ids[std]] = self.rs_target[entries[std]]
         super()._reset_idx(env_ids)
         self.hand_closed[ids] = False
         self.close_steps[ids] = 0
@@ -498,7 +536,11 @@ class G1PPTaskEnv(G1PPEnv):
         if DR and self._ready:  # the robot back at its default height before any start-bank reset (its states were recorded there)
             self.set_base_dz(ids, torch.zeros(len(ids), device=self.device))
         sel = ids[:0]
-        if self._ready and self.start_bank is not None:
+        if entries is not None:  # reset states: every demo entry is restored, the standard ones were placed above
+            sel = ids[~std]
+            if len(sel):
+                self._bank_reset(sel, entries[~std] - self.reset_states.n_standard)
+        elif self._ready and self.start_bank is not None:
             sel = ids[torch.rand(len(ids), device=self.device) < START_FRACTION]
             if len(sel):
                 self._bank_reset(sel)
@@ -543,10 +585,12 @@ class G1PPTaskEnv(G1PPEnv):
         fingers, glass_mu = self._mu_views()
         self.dr_feat[ids] = torch.stack([mass, free, fingers[ids].mean(-1), glass_mu[ids], self.delay_steps[ids].float(), dz], -1)
 
-    def _bank_reset(self, sel):
-        """Put envs ``sel`` into random start-bank states (arm joints, hand, glass pose, weld, target), at rest, water settled."""
+    def _bank_reset(self, sel, k=None):
+        """Put envs ``sel`` into start-bank states ``k`` (random without), arm joints, hand, glass pose, weld, target, at rest,
+        water settled."""
         b = self.start_bank
-        k = torch.randint(0, len(b["type"]), (len(sel),), device=self.device)
+        if k is None:
+            k = torch.randint(0, len(b["type"]), (len(sel),), device=self.device)
         q = b["q"][k]
         self.robot.write_joint_position_to_sim_index(position=q, joint_ids=self._arm_ids, env_ids=sel)
         self.robot.write_joint_velocity_to_sim_index(velocity=torch.zeros_like(q), joint_ids=self._arm_ids, env_ids=sel)
