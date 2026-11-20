@@ -98,6 +98,21 @@ v4 milestones (all 2026-11-19/20; QC method, results on 64 or 128 held-out layou
   with the recorded finger angles for held starts (`make_start_bank.py` from demos with `hand_q`).
 - The server (`g1_pp_server.py`) also reports, for evaluation only, the noise-free ring/glass/up state (`extras["clean"]`).
 
+### Physics randomisation (`G1P_DR=1`, off by default; added 2026-11-20)
+Drawn per environment at every reset: glass mass = glass alone 0.15–0.25 kg (`G1P_DR_GLASS_MASS`) + the water of its fill;
+fill level = free space 6–25 mm (`G1P_DR_FREE`; the water is settled at the fullest level and each glass leaves out the
+particles above its level, spill is measured over its own particles); right-hand finger friction 0.6–1.2 per shape
+(`G1P_DR_FINGER_MU`) and glass friction 0.5–1.0 (`G1P_DR_GLASS_MU`) with the table lowered to 0.4 (`G1P_DR_TABLE_MU`; MuJoCo
+uses the larger value of a contact pair); stiffness and damping of every actuator group ×0.8–1.2 (`G1P_DR_GAIN`); command delay
+0–2 policy steps (`G1P_DR_DELAY_MAX`); robot root height ±3 cm (`G1P_DR_BASE_DZ`, i.e. the table height seen from the robot;
+0 on start-bank resets, whose states were recorded at the default height). The critics see the drawn values (privileged block
+11 → 17), so DR runs need demos and start banks recorded with `G1P_DR=1` (`demos_pp_v6_dr.npz`, `start_bank_v7_dr.npz`).
+
+### Start banks
+`make_start_bank.py` builds pregrasp / grasped / carry / lower starts from the demos; `--recovery` adds slipped (closed hand
+over a free upright glass, not held), near_miss (lower state with the target moved 2–5 cm) and far_pregrasp (glasses at
+x ≥ 0.37 twice) starts: `start_bank_v6.npz` (1,216 starts, no DR), `start_bank_v7_dr.npz` (with DR).
+
 ### Demonstrator and data
 - `gen_pp_demos.py`: scripted pick-and-place (9-joint damped least squares, waist weighted 0.3; approach from the open side,
   close, lift, carry, lower, release, **rise 10 cm, then retreat**). Demos record observations, actions, costs and `hand_q`.
