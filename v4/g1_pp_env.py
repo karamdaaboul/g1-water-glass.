@@ -73,6 +73,26 @@ GLASS_MASS = float(os.environ.get("G1P_GLASS_MASS", "0.40"))  # kg; a real full 
 # squeezed object creep under load; the elliptic cone with impratio > 1 is MuJoCo's recommendation for grasping.
 CONE = os.environ.get("G1P_CONE", "elliptic")
 IMPRATIO = float(os.environ.get("G1P_IMPRATIO", "10.0"))
+# Physics domain randomisation (2026-11-20, user), all off unless G1P_DR=1; drawn per environment at every reset (task):
+# glass mass without water, fill level (free space above the water), finger and glass friction, actuator gains (scale),
+# command delay 0..DR_DELAY_MAX policy steps, robot root height (= table height seen from the robot; not on start-bank resets).
+DR = os.environ.get("G1P_DR") == "1"
+
+
+def _pair(name, default):
+    a, b = (float(x) for x in os.environ.get(name, default).split(","))
+    return a, b
+
+
+DR_GLASS_ONLY_MASS = _pair("G1P_DR_GLASS_MASS", "0.15,0.25")  # kg, the glass alone (the water is added from the fill)
+DR_FREE = _pair("G1P_DR_FREE", "0.006,0.025")  # m of free space above the water
+DR_FINGER_MU = _pair("G1P_DR_FINGER_MU", "0.6,1.2")  # right-hand shapes; MuJoCo takes the larger of a pair
+DR_GLASS_MU = _pair("G1P_DR_GLASS_MU", "0.5,1.0")  # glass: sets glass-table friction (the table is lowered to DR_TABLE_MU)
+DR_TABLE_MU = float(os.environ.get("G1P_DR_TABLE_MU", "0.4"))
+DR_GAIN = _pair("G1P_DR_GAIN", "0.8,1.2")  # scale of stiffness and damping of every actuator group
+DR_DELAY_MAX = int(os.environ.get("G1P_DR_DELAY_MAX", "2"))
+DR_BASE_DZ = float(os.environ.get("G1P_DR_BASE_DZ", "0.03"))  # m, robot root height offset (uniform +-)
+WATER_DENSITY = 1000.0
 HAND_EFFORT = os.environ.get("G1P_HAND_EFFORT", "1.4")  # N.m per finger joint (Dex3-1 ~1.4); "none" = no limit (before 2026-11-20)
 # grasp_sweep (16 grasps each, lift 6 cm + carry 2.5 s, no weld): old physics (pyramidal, 1, no limit, 0.2 kg, old ring) 14/16 held,
 # carry slip 2.2 cm; these defaults 16/16, carry slip 0.21 cm (max 0.46), closing shove 0.1 cm.
@@ -195,6 +215,8 @@ class G1PPSceneCfg(InteractiveSceneCfg):
     table = AssetBaseCfg(prim_path="{ENV_REGEX_NS}/Table",
                          init_state=AssetBaseCfg.InitialStateCfg(pos=(TABLE_CENTER[0], TABLE_CENTER[1], TABLE_TOP - 0.025)),
                          spawn=sim_utils.CuboidCfg(size=(TABLE_SIZE[0], TABLE_SIZE[1], 0.05), collision_props=[UsdPhysicsCollisionCfg(collision_enabled=True)],
+                                                   physics_material=(sim_utils.RigidBodyMaterialCfg(static_friction=DR_TABLE_MU, dynamic_friction=DR_TABLE_MU)
+                                                                     if DR else None),
                                                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.55, 0.42, 0.30))))
     light = AssetBaseCfg(prim_path="/World/light", spawn=sim_utils.DistantLightCfg(intensity=2500.0))
 
@@ -299,7 +321,7 @@ class G1PPEnv(ManagerBasedRLEnv):
                                   substeps=int(os.environ.get("G1P_PBF_SUBSTEPS", "16")), iterations=int(os.environ.get("G1P_PBF_ITERS", "6")),
                                   xsph_c=PBF_XSPH, floor_z=TABLE_TOP)  # spilled water lands on the table plane  # 3 iterations let a tall column bounce
         if self.water_sim is not None:
-            self.water_sim.presettle(CAVITY - FREE)
+            self.water_sim.presettle(CAVITY - (DR_FREE[0] if DR else FREE))  # DR: settle the fullest level, lower per glass
         self._pose0 = None
         self.grasped = torch.zeros(n, dtype=torch.bool, device=d)
         self.glass_start = torch.tensor([[0.36, -0.05]], device=d).repeat(n, 1)
@@ -408,6 +430,16 @@ class G1PPEnv(ManagerBasedRLEnv):
         self.grasped[ids] = on
         backend.model_changes.add(int(ModelFlags.CONSTRAINT_PROPERTIES))
         backend.notify_model_changes()
+
+    def set_glass_mass(self, ids: torch.Tensor, mass: torch.Tensor):
+        self.glass.set_masses_index(masses=mass.float().view(-1, 1).contiguous(), env_ids=ids)
+
+    def set_base_dz(self, ids: torch.Tensor, dz: torch.Tensor):
+        """Robot root at its default pose raised by dz (fixed base: Newton moves the root joint's frame)."""
+        pose = self.robot.data.default_root_pose.torch[ids].clone()
+        pose[:, :3] = pose[:, :3] + self.scene.env_origins[ids]
+        pose[:, 2] = pose[:, 2] + dz
+        self.robot.write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
 
     def _post_physics(self):
         """After each physics step, before terminations and rewards (the task refreshes its physical grasp state here)."""

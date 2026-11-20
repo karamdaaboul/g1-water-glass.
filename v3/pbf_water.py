@@ -266,6 +266,12 @@ class PBFWater:
         self.grid = wp.HashGrid(128, 128, 128, device=device)
         self.rho0 = None
         self.N = N
+        self.present = torch.ones(self.E, self.P, dtype=torch.bool, device=device)  # per-glass fill (set_fill); all by default
+
+    def set_fill(self, ids: torch.Tensor, depth: torch.Tensor):
+        """Water of glasses `ids` filled to `depth` above the floor (<= the presettled level): the particles above it are left
+        out (parked, inactive) at the next reset and do not count for spill."""
+        self.present[ids] = self.local0[None, :, 2] <= (self.bottom + depth)[:, None] - self.rp
 
     def presettle(self, depth: float, settle_s: float = 1.5, extra: float = 0.03):
         """Replace the reset lattice by a settled one with the surface `depth` above the floor: settle a deeper lattice for
@@ -287,6 +293,7 @@ class PBFWater:
         tmp.env = wp.zeros(tmp.N, dtype=wp.int32, device=self.device)
         tmp.active = wp.ones(tmp.N, dtype=wp.int32, device=self.device)
         tmp.inside = wp.ones(tmp.N, dtype=wp.int32, device=self.device)
+        tmp.present = torch.ones(1, tmp.P, dtype=torch.bool, device=self.device)
         tmp.gpos = wp.zeros(1, dtype=wp.vec3, device=self.device)
         tmp.gquat = wp.zeros(1, dtype=wp.quat, device=self.device)
         tmp.grid = wp.HashGrid(128, 128, 128, device=self.device)
@@ -307,6 +314,7 @@ class PBFWater:
         tmp.env = wp.zeros(tmp.N, dtype=wp.int32, device=self.device)
         tmp.active = wp.ones(tmp.N, dtype=wp.int32, device=self.device)
         tmp.inside = wp.ones(tmp.N, dtype=wp.int32, device=self.device)
+        tmp.present = torch.ones(1, tmp.P, dtype=torch.bool, device=self.device)
         rho0 = tmp.rho0
         tmp.reset(torch.zeros(1, dtype=torch.long, device=self.device), p0, q0)
         tmp.rho0 = rho0
@@ -329,6 +337,7 @@ class PBFWater:
             setattr(self, name, wp.zeros(N, dtype=dt, device=self.device))
         self.active = wp.ones(N, dtype=wp.int32, device=self.device)
         self.inside = wp.ones(N, dtype=wp.int32, device=self.device)
+        self.present = torch.ones(self.E, self.P, dtype=torch.bool, device=self.device)
         return self.P
 
     def _set_pose(self, pos: torch.Tensor, quat: torch.Tensor):
@@ -343,9 +352,13 @@ class PBFWater:
         act = wp.to_torch(self.active).view(self.E, self.P)
         loc = self.local0[None].expand(len(ids), -1, -1)
         q = quat[ids][:, None].expand(-1, self.P, -1)
-        x[ids] = pos[ids][:, None] + mu.quat_apply(q.reshape(-1, 4), loc.reshape(-1, 3)).view(len(ids), self.P, 3)
+        x_ids = pos[ids][:, None] + mu.quat_apply(q.reshape(-1, 4), loc.reshape(-1, 3)).view(len(ids), self.P, 3)
+        out = ~self.present[ids]
+        if out.any():  # particles above this glass's fill level: parked 5 m below it, inactive
+            x_ids[out] = (pos[ids][:, None] + torch.tensor([0.0, 0.0, -5.0], device=self.device)).expand(-1, self.P, -1)[out]
+        x[ids] = x_ids
         v[ids] = 0.0
-        act[ids] = 1
+        act[ids] = self.present[ids].to(act.dtype)
         if self.rho0 is None:  # rest density: the median density of the initial lattice's interior particles
             self.grid.build(self.x, self.h)
             wp.launch(compute_lambda, dim=self.N, inputs=[self.grid.id, self.x, self.active, self.lam, self.rho, self.h, 1.0, 1.0e3],
@@ -385,7 +398,8 @@ class PBFWater:
                                                 0.0 if self.floor_z is None else self.floor_z, 0 if self.floor_z is None else 1], device=self.device)
 
     def spilled_fraction(self) -> torch.Tensor:
-        return 1.0 - wp.to_torch(self.inside).view(self.E, self.P).float().mean(-1)
+        inside = wp.to_torch(self.inside).view(self.E, self.P).float().sum(-1)
+        return 1.0 - inside / self.present.sum(-1).clamp_min(1).float()  # the share of this glass's water outside the bowl
 
     def positions(self) -> torch.Tensor:
         return wp.to_torch(self.x).view(self.E, self.P, 3)

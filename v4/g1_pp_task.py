@@ -43,6 +43,7 @@ import isaaclab.envs.mdp as mdp
 import torch
 import torch.nn as nn
 from isaaclab.managers import ActionTerm, ActionTermCfg
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -52,6 +53,8 @@ from isaaclab.utils import configclass
 from isaaclab.utils import math as mu
 
 from g1_pp_env import (BOTTOM, CAVITY, DECIMATION, GRASP_H, HAND_CLOSED, HAND_OPEN, R_IN, SIM_DT, TABLE_TOP, G1PPEnv, G1PPEnvCfg)  # first: puts ../ and ../v3 on sys.path
+from g1_pp_env import (DR, DR_BASE_DZ, DR_DELAY_MAX, DR_FINGER_MU, DR_FREE, DR_GAIN, DR_GLASS_MU, DR_GLASS_ONLY_MASS,  # noqa: E402
+                       WATER_DENSITY)
 from g1_glass_env import RIGHT_ARM, JointVelocityServoActionCfg  # noqa: E402
 from tip_features import HAND_BODIES, tip_features
 
@@ -70,7 +73,9 @@ WAIST = ["waist_yaw_joint", "waist_pitch_joint"]
 ARM_J = RIGHT_ARM + WAIST
 N_J = len(ARM_J)  # 9 joint velocity commands, then the gripper
 GRIP = N_J
-N_PRIV, N_CONS, N_ACTOR = 11, 6 * N_J, 2 * N_J + 3 + 15 + N_J + 1
+# With G1P_DR=1 the critics also see the drawn physics (glass mass, free space, finger and glass friction, delay, base height).
+N_DR = 6 if DR else 0
+N_PRIV, N_CONS, N_ACTOR = 11 + N_DR, 6 * N_J, 2 * N_J + 3 + 15 + N_J + 1
 OBS_NOISE = os.environ.get("G1P_OBS_NOISE", "1") == "1"
 # Grasp (2026-11-20, user: real grasp): "friction" = the Dex3 holds the glass by contact alone; held = hand closed (>= CLOSE_STEPS)
 # with the glass inside the ring, refreshed after every physics step. "weld" = the old palm-glass weld (v5 and earlier).
@@ -201,6 +206,16 @@ class G1PPTaskEnvCfg(G1PPEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.episode_length_s = EPISODE_S
+        if DR:  # Isaac Lab's Newton randomisers, at every reset (glass mass, fill, delay, base height: the task's _reset_idx)
+            self.events.dr_glass_mu = EventTerm(func=mdp.randomize_rigid_body_material, mode="reset", params={
+                "asset_cfg": SceneEntityCfg("glass"), "static_friction_range": DR_GLASS_MU, "dynamic_friction_range": DR_GLASS_MU,
+                "restitution_range": (0.0, 0.0), "num_buckets": 64})
+            self.events.dr_finger_mu = EventTerm(func=mdp.randomize_rigid_body_material, mode="reset", params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="right_hand_.*"), "static_friction_range": DR_FINGER_MU,
+                "dynamic_friction_range": DR_FINGER_MU, "restitution_range": (0.0, 0.0), "num_buckets": 64})
+            self.events.dr_gains = EventTerm(func=mdp.randomize_actuator_gains, mode="reset", params={
+                "asset_cfg": SceneEntityCfg("robot"), "stiffness_distribution_params": DR_GAIN,
+                "damping_distribution_params": DR_GAIN, "operation": "scale", "distribution": "uniform"})
 
 
 class TipModel(nn.Module):
@@ -228,6 +243,10 @@ class G1PPTaskEnv(G1PPEnv):
         self.hand_closed = torch.zeros(n, dtype=torch.bool, device=d)
         self.released = torch.zeros(n, dtype=torch.bool, device=d)
         self.delayed = torch.zeros(n, dtype=torch.bool, device=d)
+        self.delay_steps = torch.zeros(n, dtype=torch.long, device=d)  # DR: 0..DR_DELAY_MAX policy steps late
+        self.act_hist = torch.zeros(n, max(DR_DELAY_MAX, 1), N_J + 1, device=d)  # DR: the last commands, newest first
+        self.dr_feat = torch.zeros(n, N_DR, device=d)
+        self._mu_bind = None
         self.policy_action = torch.zeros(n, N_J + 1, device=d)
         self.close_steps = torch.zeros(n, dtype=torch.long, device=d)
         self.cavity_center = torch.tensor([0.0, 0.0, BOTTOM + 0.5 * CAVITY], device=d)
@@ -314,7 +333,10 @@ class G1PPTaskEnv(G1PPEnv):
             com = ((local * w[..., None]).sum(1) - self.cavity_center) / self.cavity_half
         else:
             com = torch.zeros(n, 3, device=self.device)
-        return torch.cat([gv, gw, spill, com, self.hand_glass_distance()[:, None]], -1)
+        parts = [gv, gw, spill, com, self.hand_glass_distance()[:, None]]
+        if DR:
+            parts.append(self.dr_feat)
+        return torch.cat(parts, -1)
 
     def hand_points_w(self):
         """(N, 10, 3): the hand bodies' origins and the ring centre (world)."""
@@ -420,6 +442,10 @@ class G1PPTaskEnv(G1PPEnv):
         action = torch.as_tensor(action, device=self.device, dtype=torch.float32)
         # latency: envs drawn delayed this episode apply the previous command (the observation shows what the policy sent)
         applied = torch.where(self.delayed[:, None], self.policy_action, action)
+        if DR:  # 0..DR_DELAY_MAX steps late
+            hist = torch.cat([action[:, None], self.act_hist], 1)
+            applied = hist[torch.arange(self.num_envs, device=self.device), self.delay_steps.clamp(max=hist.shape[1] - 1)]
+            self.act_hist = hist[:, :-1].clone()
         self.policy_action = action.clone()
         action = applied
         free_before = ~self.grasped.clone()  # before the gripper command (a grasp or release this step: not a push)
@@ -459,20 +485,63 @@ class G1PPTaskEnv(G1PPEnv):
             self._final_clean = self.clean_state().clone()
         else:
             self._final_speed2 = torch.zeros(self.num_envs, device=self.device)
+        free = None
+        if DR and self._ready and self.water_sim is not None:  # fill level before the water resets (super and the bank)
+            free = DR_FREE[0] + (DR_FREE[1] - DR_FREE[0]) * torch.rand(len(ids), device=self.device)
+            self.water_sim.set_fill(ids, CAVITY - free)
         super()._reset_idx(env_ids)
         self.hand_closed[ids] = False
         self.close_steps[ids] = 0
         self.released[ids] = False
         self.policy_action[ids] = 0.0
         self.delayed[ids] = torch.rand(len(ids), device=self.device) < ACT_DELAY_P
+        if DR and self._ready:  # the robot back at its default height before any start-bank reset (its states were recorded there)
+            self.set_base_dz(ids, torch.zeros(len(ids), device=self.device))
+        sel = ids[:0]
         if self._ready and self.start_bank is not None:
             sel = ids[torch.rand(len(ids), device=self.device) < START_FRACTION]
             if len(sel):
                 self._bank_reset(sel)
+        if DR and self._ready:
+            self._dr_reset(ids, sel, free)
         if self._ready:
             cur = self._pos_state()
             for k in self._prev:
                 self._prev[k][ids] = cur[k][ids]
+
+    def _mu_views(self):
+        """(finger friction (n, k shapes of the right hand), glass friction (n,)) as the solver uses them."""
+        import warp as wp  # noqa: PLC0415
+
+        if self._mu_bind is None:
+            model = self.sim.backend_manager.backend.model
+            g = self.glass._root_view.get_attribute("shape_material_mu", model)[:, 0]
+            r = self.robot._root_view.get_attribute("shape_material_mu", model)[:, 0]
+            body_ids, _ = self.robot.find_bodies("right_hand_.*")
+            shapes = [s for b in self.robot.map_body_ids_to_backend(body_ids) for s in self.robot._root_view.body_shapes[b]]
+            self._mu_bind = (g, r, torch.tensor(shapes, dtype=torch.long, device=self.device))
+        g, r, idx = self._mu_bind
+        return wp.to_torch(r)[:, idx], wp.to_torch(g)[:, 0]
+
+    def _dr_reset(self, ids, sel, free):
+        """G1P_DR: glass mass (glass + the water of its fill), command delay, robot height (not on start-bank resets), and the
+        drawn values for the critics. Friction and gains were drawn by the reset events."""
+        n = len(ids)
+        if free is None:
+            free = torch.full((n,), float(os.environ.get("G1P_FREE", "0.0084")), device=self.device)
+        glass_only = DR_GLASS_ONLY_MASS[0] + (DR_GLASS_ONLY_MASS[1] - DR_GLASS_ONLY_MASS[0]) * torch.rand(n, device=self.device)
+        mass = glass_only + WATER_DENSITY * math.pi * R_IN ** 2 * (CAVITY - free)
+        self.set_glass_mass(ids, mass)
+        self.delay_steps[ids] = torch.randint(0, DR_DELAY_MAX + 1, (n,), device=self.device)
+        self.act_hist[ids] = 0.0
+        dz = DR_BASE_DZ * (2.0 * torch.rand(n, device=self.device) - 1.0)
+        dz[torch.isin(ids, sel)] = 0.0
+        self.set_base_dz(ids, dz)
+        self.scene.write_data_to_sim()
+        self.sim.forward()
+        self.robot.update(0.0)
+        fingers, glass_mu = self._mu_views()
+        self.dr_feat[ids] = torch.stack([mass, free, fingers[ids].mean(-1), glass_mu[ids], self.delay_steps[ids].float(), dz], -1)
 
     def _bank_reset(self, sel):
         """Put envs ``sel`` into random start-bank states (arm joints, hand, glass pose, weld, target), at rest, water settled."""
