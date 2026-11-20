@@ -1,0 +1,24 @@
+# Code only: training runs, evaluations, videos, demos and other data stay on disk.
+__pycache__/
+*.pyc
+runs/*/
+runs_pp/
+runs_v2/
+eval/
+eval_pp/
+eval_v2/
+videos/
+debug/
+v4/tipdata/
+v4/bankvid/
+v4/demovid/
+v4/demovid2/
+*.npz
+*.pt
+*.pkl
+*.hdf5
+*.mp4
+*.gif
+*.log
+*.nohup
+*.done
